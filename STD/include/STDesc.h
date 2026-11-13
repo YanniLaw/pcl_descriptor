@@ -80,17 +80,17 @@ typedef struct STDesc {
 
 // plane structure for corner point extraction
 typedef struct Plane {
-  pcl::PointXYZINormal p_center_;
-  Eigen::Vector3d center_;
-  Eigen::Vector3d normal_;
-  Eigen::Matrix3d covariance_;
-  float radius_ = 0;
-  float min_eigen_value_ = 1;
-  float intercept_ = 0;
-  int id_ = 0;
-  int sub_plane_num_ = 0;
-  int points_size_ = 0;
-  bool is_plane_ = false;
+  pcl::PointXYZINormal p_center_;   // 带法向量的平面中心点，打包方便后面使用
+  Eigen::Vector3d center_;          // 平面中心点
+  Eigen::Vector3d normal_;          // 平面法向量
+  Eigen::Matrix3d covariance_;      // 平面协方差矩阵
+  float radius_ = 0;                // 平面半径(最大特征值的平方根，保存最大散布方向的尺度)
+  float min_eigen_value_ = 1;       // 最小特征值
+  float intercept_ = 0;             // 平面方程中的截距项d
+  int id_ = 0;                      // 平面ID
+  int sub_plane_num_ = 0;           // 子平面数量
+  int points_size_ = 0;             // 平面内点的数量
+  bool is_plane_ = false;           // 是否为平面
 } Plane;
 
 typedef struct STDMatchList {
@@ -168,24 +168,24 @@ template <> struct std::hash<STDesc_LOC> {
 class OctoTree {
 public:
   ConfigSetting config_setting_;
-  std::vector<Eigen::Vector3d> voxel_points_;
-  Plane *plane_ptr_;
-  int layer_;
+  std::vector<Eigen::Vector3d> voxel_points_; // 存储该八叉树节点的点云数据
+  Plane *plane_ptr_;  // 指向平面结构的指针
+  int layer_;  // 八叉树层级
   int octo_state_; // 0 is end of tree, 1 is not
-  int merge_num_ = 0;
-  bool is_project_ = false;
-  std::vector<Eigen::Vector3d> proj_normal_vec_;
+  int merge_num_ = 0; // 合并的节点数量
+  bool is_project_ = false;  // 是否投影
+  std::vector<Eigen::Vector3d> proj_normal_vec_;  // 投影法向量
 
   // check 6 direction: x,y,z,-x,-y,-z
-  bool is_check_connect_[6];
-  bool connect_[6];
-  OctoTree *connect_tree_[6];
+  bool is_check_connect_[6];  // 是否检查连接
+  bool connect_[6];           // 连接状态
+  OctoTree *connect_tree_[6]; // 连接的八叉树节点指针
 
-  bool is_publish_ = false;
-  OctoTree *leaves_[8];
-  double voxel_center_[3]; // x, y, z
-  float quater_length_;
-  bool init_octo_;
+  bool is_publish_ = false;  // 是否发布
+  OctoTree *leaves_[8];  // 子节点指针
+  double voxel_center_[3]; // 体素中心点 x, y, z
+  float quater_length_;  // 体素半边长
+  bool init_octo_;  // 是否初始化八叉树
   OctoTree(const ConfigSetting &config_setting)
       : config_setting_(config_setting) {
     voxel_points_.clear();
@@ -280,13 +280,13 @@ public:
   // hash table, save all descriptors
   std::unordered_map<STDesc_LOC, std::vector<STDesc>> data_base_;
 
-  // save all key clouds, optional
+  // save all key clouds, optional 存储的是累积的关键帧点云数据
   std::vector<pcl::PointCloud<pcl::PointXYZI>::Ptr> key_cloud_vec_;
 
-  // save all corner points, optional
+  // save all corner points, optional 存储的是累积的关键帧角点云数据
   std::vector<pcl::PointCloud<pcl::PointXYZINormal>::Ptr> corner_cloud_vec_;
 
-  // save all planes of key frame, required
+  // save all planes of key frame, required 存储的是累积的关键帧平面点云数据
   std::vector<pcl::PointCloud<pcl::PointXYZINormal>::Ptr> plane_cloud_vec_;
 
   /*Three main processing functions*/

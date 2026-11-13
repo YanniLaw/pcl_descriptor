@@ -1,4 +1,12 @@
 #include "include/STDesc.h"
+/**
+ * @brief 体素下采样函数，用于减少点云数据量
+ * 手写的体素栅格降采样(voxel-grid centroid): 把点云按边长 voxel_size 切成三维格子，
+ * 每格内所有点的 x,y,z,intensity 取算术平均，合成一个点输出，从而把点数降到与「体素数量」同量级。
+ * 功能上等价于 pcl::VoxelGrid<PointXYZI> 的默认（质心）模式，
+ * @param pl_feat 输入的点云
+ * @param voxel_size 体素大小
+ */
 void down_sampling_voxel(pcl::PointCloud<pcl::PointXYZI> &pl_feat,
                          double voxel_size) {
   int intensity = rand() % 255;
@@ -305,16 +313,21 @@ void publish_std_pairs(
   ma_line.markers.clear();
 }
 
+/**
+ * @brief 生成稳定三角形描述子
+ * @param input_cloud 输入点云
+ * @param stds_vec 生成的稳定三角形描述子向量
+ */
 void STDescManager::GenerateSTDescs(
     pcl::PointCloud<pcl::PointXYZI>::Ptr &input_cloud,
     std::vector<STDesc> &stds_vec) {
 
   // step1, voxelization and plane dection
-  std::unordered_map<VOXEL_LOC, OctoTree *> voxel_map;
+  std::unordered_map<VOXEL_LOC, OctoTree *> voxel_map; // 体素八叉树地图
   init_voxel_map(input_cloud, voxel_map);
   pcl::PointCloud<pcl::PointXYZINormal>::Ptr plane_cloud(
       new pcl::PointCloud<pcl::PointXYZINormal>);
-  getPlane(voxel_map, plane_cloud);
+  getPlane(voxel_map, plane_cloud); // 获取所有平面体素，转成带法向量的中心点
   // std::cout << "[Description] planes size:" << plane_cloud->size() <<
   // std::endl;
   plane_cloud_vec_.push_back(plane_cloud);
@@ -419,6 +432,7 @@ void STDescManager::AddSTDescs(const std::vector<STDesc> &stds_vec) {
   return;
 }
 
+// 按空间位置把点分配到不同体素中，再对每个体素进行局部平面检测
 void STDescManager::init_voxel_map(
     const pcl::PointCloud<pcl::PointXYZI>::Ptr &input_cloud,
     std::unordered_map<VOXEL_LOC, OctoTree *> &voxel_map) {
@@ -444,6 +458,9 @@ void STDescManager::init_voxel_map(
       voxel_map[position]->voxel_points_.push_back(p_c);
     }
   }
+  // 当前这份 STD 实现没有像FAST-LIVO2那样继续划分子节点，实际使用的是固定尺寸的单层体素哈希表
+
+  // 下面这两个本来是为了多线程初始化八叉树体素地图，但当前没有实际使用
   std::vector<std::unordered_map<VOXEL_LOC, OctoTree *>::iterator> iter_list;
   std::vector<size_t> index;
   size_t i = 0;
@@ -467,13 +484,23 @@ void STDescManager::init_voxel_map(
   //     [&](const size_t &i) { iter_list[i]->second->init_octo_tree(); });
 }
 
+/**
+ * @brief 建立相邻体素之间的连接关系，为后续寻找投影平面、提取角点做准备
+ * 它主要回答两个问题: 
+ * - 两个相邻的平面体素，方向是否相近
+ * - 一个非平面体素，旁边有哪些可以借用的平面
+ * @param voxel_map 
+ */
 void STDescManager::build_connection(
     std::unordered_map<VOXEL_LOC, OctoTree *> &voxel_map) {
   for (auto iter = voxel_map.begin(); iter != voxel_map.end(); iter++) {
     if (iter->second->plane_ptr_->is_plane_) {
       OctoTree *current_octo = iter->second;
+      // 1. 以平面体素为起点，检查六个方向的邻居
+      // 在 6-邻域体素之间建立连接表，把"哪些体素属于同一片平面""哪些非平面体素贴着哪个平面"记录下来
+      // 六个方向编号如下:  0 +x 1 +y 2 +z 3 -x 4 -y 5 -z
       for (int i = 0; i < 6; i++) {
-        VOXEL_LOC neighbor = iter->first;
+        VOXEL_LOC neighbor = iter->first; // 当前体素的坐标，作为邻域体素的起点
         if (i == 0) {
           neighbor.x = neighbor.x + 1;
         } else if (i == 1) {
@@ -487,12 +514,13 @@ void STDescManager::build_connection(
         } else if (i == 5) {
           neighbor.z = neighbor.z - 1;
         }
+        // 2. 根据邻居类型，设置不同的连接
         auto near = voxel_map.find(neighbor);
-        if (near == voxel_map.end()) {
+        if (near == voxel_map.end()) { // 2.1 邻居不存在，标记为未连接
           current_octo->is_check_connect_[i] = true;
           current_octo->connect_[i] = false;
-        } else {
-          if (!current_octo->is_check_connect_[i]) {
+        } else { // 存在该邻居
+          if (!current_octo->is_check_connect_[i]) { // 该邻居尚未检查过
             OctoTree *near_octo = near->second;
             current_octo->is_check_connect_[i] = true;
             int j;
@@ -501,8 +529,8 @@ void STDescManager::build_connection(
             } else {
               j = i + 3;
             }
-            near_octo->is_check_connect_[j] = true;
-            if (near_octo->plane_ptr_->is_plane_) {
+            near_octo->is_check_connect_[j] = true; // 双向标记(见六个方向的编号)
+            if (near_octo->plane_ptr_->is_plane_) { // 2.2 邻居也是平面体素
               // merge near octo
               Eigen::Vector3d normal_diff = current_octo->plane_ptr_->normal_ -
                                             near_octo->plane_ptr_->normal_;
@@ -520,7 +548,7 @@ void STDescManager::build_connection(
                 current_octo->connect_[i] = false;
                 near_octo->connect_[j] = false;
               }
-            } else {
+            } else { // 2.3 邻居不是平面体素
               current_octo->connect_[i] = false;
               near_octo->connect_[j] = true;
               near_octo->connect_tree_[j] = current_octo;
@@ -532,6 +560,7 @@ void STDescManager::build_connection(
   }
 }
 
+// 遍历所有体素，把已经判定为平面的体素，各自转换成一个“带法向量的中心点”
 void STDescManager::getPlane(
     const std::unordered_map<VOXEL_LOC, OctoTree *> &voxel_map,
     pcl::PointCloud<pcl::PointXYZINormal>::Ptr &plane_cloud) {
@@ -1469,6 +1498,7 @@ void STDescManager::PlaneGeomrtricIcp(
   // std::cout << "useful match for icp:" << useful_match << std::endl;
 }
 
+// 分析一个体素里的点是否接近一个平面；如果接近，就计算平面中心、法向量和平面方程
 void OctoTree::init_plane() {
   plane_ptr_->covariance_ = Eigen::Matrix3d::Zero();
   plane_ptr_->center_ = Eigen::Vector3d::Zero();
@@ -1479,10 +1509,14 @@ void OctoTree::init_plane() {
     plane_ptr_->covariance_ += pi * pi.transpose();
     plane_ptr_->center_ += pi;
   }
+  // 计算点云中心点和协方差矩阵
   plane_ptr_->center_ = plane_ptr_->center_ / plane_ptr_->points_size_;
   plane_ptr_->covariance_ =
       plane_ptr_->covariance_ / plane_ptr_->points_size_ -
       plane_ptr_->center_ * plane_ptr_->center_.transpose();
+  // 计算协方差矩阵的特征值和特征向量
+  // 特征向量: 表示点云的分布方向  特征值: 表示点云在该方向上的分布程度
+  // 最小特征值对应的特征向量即为点云最薄的方向，作为平面的法向量方向
   Eigen::EigenSolver<Eigen::Matrix3d> es(plane_ptr_->covariance_);
   Eigen::Matrix3cd evecs = es.eigenvectors();
   Eigen::Vector3cd evals = es.eigenvalues();
@@ -1492,13 +1526,23 @@ void OctoTree::init_plane() {
   evalsReal.rowwise().sum().minCoeff(&evalsMin);
   evalsReal.rowwise().sum().maxCoeff(&evalsMax);
   int evalsMid = 3 - evalsMin - evalsMax;
+  // 一片平面上的点，沿平面内部两个方向分布较广，沿垂直平面的方向很薄。最薄的方向就是法向量方向
+  // 如果最小特征值小于阈值，则认为该体素内的点接近一个平面
   if (evalsReal(evalsMin) < config_setting_.plane_detection_thre_) {
     plane_ptr_->normal_ << evecs.real()(0, evalsMin), evecs.real()(1, evalsMin),
         evecs.real()(2, evalsMin);
     plane_ptr_->min_eigen_value_ = evalsReal(evalsMin);
     plane_ptr_->radius_ = sqrt(evalsReal(evalsMax));
     plane_ptr_->is_plane_ = true;
-
+    // 计算平面方程的截距项 即 平面方程 ax + by + cz + d = 0 中的 d
+    // n = [a, b, c]^T 为平面的法向量
+    // 作用？
+    // 1. 计算点到平面的距离;
+    // 2. 把点投影到平面上;
+    // 比如 normal = (0,0,1) d = -2; 对应平面 z -2 = 0 即 z = 2
+    // 当法向量长度为1时，点p=(1,3,5)到这个平面的距离为 |normal·p + d| = |0*1 + 0*3 + 1*5 - 2| = 3
+    // 这可以用来判断一个点是否足够靠近平面，作为匹配筛选条件
+    // 同一个点p=(1,3,5)投影到平面z = 2后，得到p'=(1,3,2)。STD提取关键点时就需要这种投影操作
     plane_ptr_->intercept_ = -(plane_ptr_->normal_(0) * plane_ptr_->center_(0) +
                                plane_ptr_->normal_(1) * plane_ptr_->center_(1) +
                                plane_ptr_->normal_(2) * plane_ptr_->center_(2));

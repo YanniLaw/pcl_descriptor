@@ -92,7 +92,7 @@ bool syncPackages(PointCloud::Ptr &cloud, Eigen::Affine3d &pose) {
 
 void update_poses(const gtsam::Values &estimates,
                   std::vector<Eigen::Affine3d> &poses) {
-  assert(estimates.size() == poses.size());
+  assert(estimates.size() == poses.size()); // 注意 这个是相等的
 
   poses.clear();
 
@@ -205,12 +205,20 @@ int main(int argc, char **argv) {
 
   STDescManager *std_manager = new STDescManager(config_setting);
 
-  gtsam::Values initial;
-  gtsam::NonlinearFactorGraph graph;
+  gtsam::Values initial; // 创建一个空容器(本质是key->value字典)
+  gtsam::NonlinearFactorGraph graph; // 创建一个空因子图(本质是约束集合，每个约束对应一个因子Factor)
 
   // https://github.com/TixiaoShan/LIO-SAM/blob/6665aa0a4fcb5a9bb3af7d3923ae4a035b489d47/src/mapOptmization.cpp#L1385
+  // 六维对角高斯噪声模型，用来描述里程计约束的不确定性 (roll, pitch, yaw, x, y, z)
+  // 等价于: 
+  // auto odometryNoise =
+  //   gtsam::noiseModel::Diagonal::Sigmas( // Sigmas是使用标准差而不是方差来定义噪声模型
+  //       (gtsam::Vector(6) <<
+  //           0.001, 0.001, 0.001,
+  //           0.01,  0.01,  0.01
+  //       ).finished());
   gtsam::noiseModel::Diagonal::shared_ptr odometryNoise =
-      gtsam::noiseModel::Diagonal::Variances(
+      gtsam::noiseModel::Diagonal::Variances( // Variances是使用方差而不是标准差来定义噪声模型
           (gtsam::Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
 
   gtsam::noiseModel::Diagonal::shared_ptr priorNoise =
@@ -227,22 +235,24 @@ int main(int argc, char **argv) {
       gtsam::noiseModel::Robust::Create(
           gtsam::noiseModel::mEstimator::Cauchy::Create(1),
           gtsam::noiseModel::Diagonal::Variances(robustNoiseVector6));
-
+  // 设置重线性化阈值和跳过次数
+  // 这里表示每次 update() 都检查重线性化条件，变量相对线性化点的改变量超过阈值时，触发相应处理。
+  // 若没有达到条件，第二次更新可能几乎不改变结果
   gtsam::ISAM2Params parameters;
   parameters.relinearizeThreshold = 0.01;
   parameters.relinearizeSkip = 1;
-  gtsam::ISAM2 isam(parameters);
+  gtsam::ISAM2 isam(parameters); // 创建一个增量平滑求解器
 
-  size_t cloudInd = 0;
-  size_t keyCloudInd = 0;
+  size_t cloudInd = 0;    // 每个成功同步的普通单帧点云索引
+  size_t keyCloudInd = 0; // 多帧累积的关键帧点云索引
 
-  std::vector<PointCloud::Ptr> cloud_vec;
-  std::vector<Eigen::Affine3d> pose_vec;
-  std::vector<Eigen::Affine3d> origin_pose_vec;
-  std::vector<Eigen::Affine3d> key_pose_vec;
-  std::vector<std::pair<int, int>> loop_container;
+  std::vector<PointCloud::Ptr> cloud_vec; // 存储单帧原始点云
+  std::vector<Eigen::Affine3d> pose_vec;  // 存储优化后位姿
+  std::vector<Eigen::Affine3d> origin_pose_vec; // 存储优化前位姿
+  std::vector<Eigen::Affine3d> key_pose_vec;    // 存储所有关键帧位姿
+  std::vector<std::pair<int, int>> loop_container; // 存储所有回环检测结果的索引对
 
-  PointCloud::Ptr key_cloud(new PointCloud);
+  PointCloud::Ptr key_cloud(new PointCloud); // 存储当前关键帧点云(多帧累积)
 
   bool has_loop_flag = false;
   gtsam::Values curr_estimate;
@@ -255,6 +265,7 @@ int main(int argc, char **argv) {
     PointCloud::Ptr current_cloud_body(new PointCloud);
     PointCloud::Ptr current_cloud_world(new PointCloud);
     Eigen::Affine3d pose;
+    // 获取同步后的点云和里程计位姿信息
     if (syncPackages(current_cloud_body, pose)) {
       auto origin_estimate_affine3d = pose;
       pcl::transformPointCloud(*current_cloud_body, *current_cloud_world, pose);
@@ -270,7 +281,7 @@ int main(int argc, char **argv) {
       sensor_msgs::PointCloud2 pub_cloud;
       pcl::toROSMsg(origin_cloud, pub_cloud);
       pub_cloud.header.frame_id = "camera_init";
-      pubOriginCloud.publish(pub_cloud);
+      pubOriginCloud.publish(pub_cloud); // 发布当前帧点云(world坐标系下)
 
       Eigen::Quaterniond _r(origin_estimate_affine3d.rotation());
       nav_msgs::Odometry odom;
@@ -282,15 +293,15 @@ int main(int argc, char **argv) {
       odom.pose.pose.orientation.x = _r.x();
       odom.pose.pose.orientation.y = _r.y();
       odom.pose.pose.orientation.z = _r.z();
-      pubOdomOrigin.publish(odom);
-
-      *key_cloud += *current_cloud_world;
+      pubOdomOrigin.publish(odom); // 发布优化前位姿
+      // world坐标系下点云先滤波，再累积
+      *key_cloud += *current_cloud_world; // 点云累积，用于后面提取描述子进行回环检测
       initial.insert(cloudInd, gtsam::Pose3(pose.matrix()));
 
-      if (!cloudInd) {
+      if (!cloudInd) { // 添加首帧先验因子到因子图
         graph.add(gtsam::PriorFactor<gtsam::Pose3>(
             0, gtsam::Pose3(pose.matrix()), odometryNoise));
-      } else {
+      } else { // 添加里程计约束因子到因子图
         auto prev_pose = gtsam::Pose3(origin_pose_vec[cloudInd - 1].matrix());
         auto curr_pose = gtsam::Pose3(pose.matrix());
         graph.add(gtsam::BetweenFactor<gtsam::Pose3>(
@@ -299,6 +310,9 @@ int main(int argc, char **argv) {
       }
 
       // check if keyframe
+      // sub_frame_num_参数在这里有两个作用: 
+      // 1. 控制点云累积和描述子提取的间隔;
+      // 2. 控制一次闭环添加多少条 GTSAM 约束
       if (cloudInd % config_setting.sub_frame_num_ == 0 && cloudInd != 0) {
         ROS_INFO("key frame idx: [%d], key cloud size: [%d]", (int)keyCloudInd,
                  (int)key_cloud->size());
@@ -307,12 +321,17 @@ int main(int argc, char **argv) {
         std_manager->GenerateSTDescs(key_cloud, stds_vec);
 
         // step2. Searching Loop
-        std::pair<int, double> search_result(-1, 0);
+        // search_result.first   // 回环找到的历史关键点云编号，对应 keyCloudInd 这一层
+        // search_result.second  // 几何验证得分，越大越好
+        std::pair<int, double> search_result(-1, 0); // 找到哪份历史点云
         std::pair<Eigen::Vector3d, Eigen::Matrix3d> loop_transform;
-        loop_transform.first << 0, 0, 0;
-        loop_transform.second = Eigen::Matrix3d::Identity();
-        std::vector<std::pair<STDesc, STDesc>> loop_std_pair;
-
+        loop_transform.first << 0, 0, 0; // 平移
+        loop_transform.second = Eigen::Matrix3d::Identity(); // 旋转
+        // loop_std_pair[i].first   // 当前关键点云中的描述子
+        // loop_std_pair[i].second  // 匹配的历史关键点云中的描述子
+        std::vector<std::pair<STDesc, STDesc>> loop_std_pair; // 匹配成功的描述子对
+        // 等积累了足够多的累积关键帧后，才开始进行回环检测
+        // 所以没有积累足够多的累积关键帧之前，都是进行描述子提取、保存描述子，积累历史数据库的步骤
         if (keyCloudInd > config_setting.skip_near_num_) {
           std_manager->SearchLoop(stds_vec, search_result, loop_transform,
                                   loop_std_pair);
@@ -325,20 +344,20 @@ int main(int argc, char **argv) {
         sensor_msgs::PointCloud2 pub_cloud;
         pcl::toROSMsg(*key_cloud, pub_cloud);
         pub_cloud.header.frame_id = "camera_init";
-        pubCurrentCloud.publish(pub_cloud);
+        pubCurrentCloud.publish(pub_cloud); // 发布当前关键帧累积点云
         pcl::toROSMsg(*std_manager->corner_cloud_vec_.back(), pub_cloud);
         pub_cloud.header.frame_id = "camera_init";
-        pubCurrentCorner.publish(pub_cloud);
+        pubCurrentCorner.publish(pub_cloud); // 发布当前关键帧累积角点云
 
         std_manager->key_cloud_vec_.push_back(key_cloud->makeShared());
-
+        // 检测到回环(没有合格闭环时，返回 {-1, 0})
         if (search_result.first > 0) {
           std::cout << "[Loop Detection] triggle loop: " << keyCloudInd << "--"
                     << search_result.first << ", score:" << search_result.second
                     << std::endl;
 
           has_loop_flag = true;
-          int match_frame = search_result.first;
+          int match_frame = search_result.first; // 对应回环找到的历史关键点云编号 keyCloudInd
           // obtain optimal transform
           std_manager->PlaneGeomrtricIcp(
               std_manager->plane_cloud_vec_.back(),
@@ -360,22 +379,26 @@ int main(int argc, char **argv) {
             between each sub frame, 51-11, 52-12,...,60-20.
 
           */
+          // 因为回环检测是基于累积的关键帧的(每个累积关键帧由 sub_frame_num 个普通帧组成)，
+          // 所以在添加回环约束时，需要对每个普通子帧进行相应的处理
           int sub_frame_num = config_setting.sub_frame_num_;
+          // 其实就是 [cloudInd-9, cloudInd]
           for (size_t j = 1; j <= sub_frame_num; j++) {
-            int src_frame = cloudInd + j - sub_frame_num;
+            int src_frame = cloudInd + j - sub_frame_num; // 当前普通帧
 
-            auto delta_T = Eigen::Affine3d::Identity();
+            auto delta_T = Eigen::Affine3d::Identity(); // T_tar_src
             delta_T.translate(loop_transform.first);
             delta_T.rotate(loop_transform.second);
+            // 经过回环变换后补偿的当前普通帧位姿
             Eigen::Affine3d src_pose_refined = delta_T * pose_vec[src_frame];
-
-            int tar_frame = match_frame * sub_frame_num + j;
+            // match_frame 是基于 keyCloudInd 的，下面就是这个累积关键帧对应到普通帧的换算关系
+            int tar_frame = match_frame * sub_frame_num + j; // 匹配到的历史普通帧
             // old
             // Eigen::Affine3d tar_pose = pose_vec[tar_frame];
             Eigen::Affine3d tar_pose = origin_pose_vec[tar_frame];
 
             loop_container.push_back({tar_frame, src_frame});
-
+            // 添加回环约束因子到因子图
             graph.add(gtsam::BetweenFactor<gtsam::Pose3>(
                 tar_frame, src_frame,
                 gtsam::Pose3(tar_pose.matrix())
@@ -386,21 +409,30 @@ int main(int argc, char **argv) {
           pcl::toROSMsg(*std_manager->key_cloud_vec_[search_result.first],
                         pub_cloud);
           pub_cloud.header.frame_id = "camera_init";
-          pubMatchedCloud.publish(pub_cloud);
+          pubMatchedCloud.publish(pub_cloud); // 发布回环匹配到的累积关键帧点云
 
           pcl::toROSMsg(*std_manager->corner_cloud_vec_[search_result.first],
                         pub_cloud);
           pub_cloud.header.frame_id = "camera_init";
-          pubMatchedCorner.publish(pub_cloud);
+          pubMatchedCorner.publish(pub_cloud); // 发布回环匹配到的累积关键帧角点云
           publish_std_pairs(loop_std_pair, pubSTD);
         }
 
         key_cloud->clear();
         ++keyCloudInd;
       }
-      isam.update(graph, initial);
-      isam.update();
+      // graph 包含本轮新增的里程计约束，以及可能检测到的闭环约束；initial 提供新节点的初始位姿
+      // iSAM2 将它们加入内部保存的历史图中，更新求解结果。闭环约束可能使多个历史节点的位姿一起改变
+      // sam.update(graph, initial); 这一行本身已经执行求解更新
+      isam.update(graph, initial); // 加入本轮新数据，并更新求解结果
+      // 不传参数时，使用默认的空因子图和空变量集合，等价于：
+      // isam.update(gtsam::NonlinearFactorGraph(), gtsam::Values());
+      // 这次没有添加新数据，但 iSAM2 内部仍保存着之前提交的全部约束，因此可以继续更新已有问题
+      isam.update();               // 基于已保存的图，再更新一次
+      // 连续调用的原因是：位姿优化是非线性问题，一次更新后，可能需要在调整后的位姿附近重新计算线性近似，
+      // 再继续修正。 这个过程叫“重线性化”
 
+      // 如果检测到闭环，则进行多次重线性化更新，确保位姿优化收敛，也是为了让闭环带来的较大修正继续得到处理。
       if (has_loop_flag) {
         isam.update();
         isam.update();
@@ -408,10 +440,27 @@ int main(int argc, char **argv) {
         isam.update();
         isam.update();
       }
+      // 普通帧调用 2 次更新，闭环帧调用 7 次更新；这些调用都按阈值决定实际需要做多少工作
 
-      graph.resize(0);
-      initial.clear();
+      // 清空本轮新增的因子图和初始值，为下一轮更新做准备
+      // graph 中保存本轮新增的里程计约束、闭环约束。执行后 graph.size() == 0
+      // 下一帧再往里面添加新约束。
+      // 之前通过 isam.update() 提交的因子仍保存在求解器中!!!
+      graph.resize(0); // 清空本轮新增的因子图
+      initial.clear(); // 清空本轮新增变量的初始值
+      // 比如本轮添加的是：initial.insert(5, pose5);
+      // 那么提交并清空后，下一轮就可以只放第 6 帧， initial.insert(6, pose6);
+      // 第 5 帧的状态已经由 isam 管理
+      /*
+      整个流程就是：
+      1. 准备本轮新增约束和新节点初值;
+      2. 提交给持续保存历史状态的求解器;
+      3. 清空临时容器，下一轮重新装入新数据.   
+      这样可以避免下一轮重复提交旧因子和已有变量.
+      重复提交因子会重复计入约束；initial 则要求只包含尚未加入 isam 的新变量。
+      */
 
+      // 取得目前位姿图中，所有节点的位姿估计结果
       curr_estimate = isam.calculateEstimate();
       update_poses(curr_estimate, pose_vec);
 
